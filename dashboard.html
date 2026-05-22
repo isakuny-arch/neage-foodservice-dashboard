@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>neage Foodservice Dashboard</title>
+  <!-- Chart.js for graphs -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <!-- jQuery and DataTables for tables -->
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css" />
+  <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 20px;
+      line-height: 1.5;
+    }
+    h1, h2 {
+      margin-top: 1em;
+    }
+    #chart-container {
+      width: 100%;
+      max-width: 1000px;
+      margin-bottom: 2rem;
+    }
+    table.dataTable {
+      width: 100% !important;
+    }
+  </style>
+</head>
+<body>
+  <h1>neage Foodservice Dashboard</h1>
+  <p>
+    Select chain:
+    <select id="chain-select"></select>
+  </p>
+  <div id="chart-container">
+    <canvas id="chart"></canvas>
+  </div>
+  <h2>Price Index Ranking (latest value)</h2>
+  <table id="ranking-table" class="display"></table>
+  <h2>All Records</h2>
+  <table id="data-table" class="display"></table>
+
+  <script>
+    /**
+     * Fetch the data file.  This assumes that the JSON file is located at
+     * `data/neage_foodservice_events.json` relative to this HTML page.  If
+     * hosting via GitHub Pages the data folder should be published as part
+     * of the site.
+     */
+    async function loadData() {
+      const response = await fetch('data/neage_foodservice_events.json');
+      if (!response.ok) {
+        console.error('Failed to load JSON data', response.status);
+        return [];
+      }
+      return await response.json();
+    }
+
+    /**
+     * Compute price indices relative to the first observed price on or before
+     * the baseline year.  Each unique (chain, product, variant) series is
+     * normalised independently.
+     */
+    function computeIndices(records, startYear) {
+      const seriesMap = {};
+      records.forEach((rec) => {
+        const key = `${rec.chain}|${rec.product}|${rec.variant}`;
+        (seriesMap[key] = seriesMap[key] || []).push(rec);
+      });
+      const indices = [];
+      Object.values(seriesMap).forEach((series) => {
+        series.sort((a, b) => new Date(a.date) - new Date(b.date));
+        let baseline = null;
+        for (const rec of series) {
+          const year = new Date(rec.date).getFullYear();
+          if (year <= startYear) {
+            baseline = rec.price;
+          }
+        }
+        if (baseline === null) {
+          baseline = series[0].price;
+        }
+        series.forEach((rec) => {
+          indices.push({
+            chain: rec.chain,
+            product: rec.product,
+            variant: rec.variant,
+            date: rec.date,
+            price: rec.price,
+            index: (rec.price / baseline) * 100,
+            source_url: rec.source_url,
+          });
+        });
+      });
+      return indices;
+    }
+
+    /** Build the ranking table showing the latest index for each chain. */
+    function buildRanking(indices) {
+      const latestMap = {};
+      indices.forEach((rec) => {
+        const key = rec.chain;
+        const recDate = new Date(rec.date);
+        if (!latestMap[key] || recDate > new Date(latestMap[key].date)) {
+          latestMap[key] = rec;
+        }
+      });
+      return Object.entries(latestMap)
+        .map(([chain, rec]) => [chain, rec.index])
+        .sort((a, b) => b[1] - a[1]);
+    }
+
+    /** Populate the chain selector. */
+    function populateChainSelect(chains) {
+      const select = document.getElementById('chain-select');
+      chains.forEach((chain) => {
+        const opt = document.createElement('option');
+        opt.value = chain;
+        opt.textContent = chain;
+        select.appendChild(opt);
+      });
+    }
+
+    /** Render a line chart for the selected chain. */
+    function drawChart(indices, chain) {
+      const ctx = document.getElementById('chart').getContext('2d');
+      const filtered = indices.filter((i) => i.chain === chain);
+      const seriesMap = {};
+      filtered.forEach((rec) => {
+        const key = `${rec.product} ${rec.variant}`;
+        (seriesMap[key] = seriesMap[key] || []).push(rec);
+      });
+      const labels = Array.from(
+        new Set(filtered.map((rec) => rec.date))
+      ).sort();
+      const datasets = Object.entries(seriesMap).map(([name, list]) => {
+        const data = labels.map((d) => {
+          const r = list.find((x) => x.date === d);
+          return r ? r.index : null;
+        });
+        return { label: name, data, fill: false };
+      });
+      if (window.chartInstance) {
+        window.chartInstance.destroy();
+      }
+      window.chartInstance = new Chart(ctx, {
+        type: 'line',
+        data: { labels, datasets },
+        options: {
+          responsive: true,
+          interaction: { mode: 'index', intersect: false },
+          plugins: {
+            tooltip: {
+              callbacks: {
+                label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)}`,
+              },
+            },
+            legend: {
+              position: 'bottom',
+            },
+          },
+          scales: {
+            y: { title: { display: true, text: 'Price Index (1996 = 100)' } },
+            x: { title: { display: true, text: 'Date' } },
+          },
+        },
+      });
+    }
+
+    /** Initialise the dashboard. */
+    async function init() {
+      const raw = await loadData();
+      if (!raw.length) {
+        alert('No data found. Make sure you have run the scraper and uploaded the JSON.');
+        return;
+      }
+      const indices = computeIndices(raw, 1996);
+      const chains = Array.from(new Set(indices.map((i) => i.chain))).sort();
+      populateChainSelect(chains);
+      document.getElementById('chain-select').addEventListener('change', function () {
+        drawChart(indices, this.value);
+      });
+      drawChart(indices, chains[0]);
+
+      // Ranking table
+      const ranking = buildRanking(indices);
+      $('#ranking-table').DataTable({
+        data: ranking,
+        columns: [
+          { title: 'Chain' },
+          { title: 'Latest Index' },
+        ],
+        destroy: true,
+      });
+
+      // Full data table
+      const tableData = indices.map((rec) => [
+        rec.chain,
+        rec.product,
+        rec.variant,
+        rec.date,
+        rec.price.toFixed(2),
+        rec.index.toFixed(1),
+        rec.source_url,
+      ]);
+      $('#data-table').DataTable({
+        data: tableData,
+        columns: [
+          { title: 'Chain' },
+          { title: 'Product' },
+          { title: 'Variant' },
+          { title: 'Date' },
+          { title: 'Price' },
+          { title: 'Index' },
+          { title: 'Source URL' },
+        ],
+        pageLength: 25,
+        destroy: true,
+      });
+    }
+    init();
+  </script>
+</body>
+</html>
