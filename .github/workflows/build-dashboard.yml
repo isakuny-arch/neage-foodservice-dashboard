@@ -40,7 +40,16 @@ jobs:
           python scrape_neage_foodservice.py \
             --start-year 1996 \
             --out data/neage_foodservice_events.json \
-            --csv data/neage_foodservice_events.csv
+            --csv data/neage_foodservice_events.csv \
+            --failed data/neage_foodservice_failed.json \
+            --delay 0.7 \
+            --max-pages 180
+          echo "JSON bytes:"
+          wc -c data/neage_foodservice_events.json
+          echo "CSV lines:"
+          wc -l data/neage_foodservice_events.csv || true
+          echo "Failed pages:"
+          cat data/neage_foodservice_failed.json
 
       - name: Upload pages artifact
         uses: actions/upload-pages-artifact@v3
