@@ -1,454 +1,516 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-値上げ備忘録 neage.jp 外食カテゴリ scraper v2
+neage.jp 外食カテゴリ用スクレイパー v3
 
-- https://neage.jp/gaisyoku/index.html を入口に外食カテゴリ配下を再帰的に収集
-- HTML table だけでなく、本文テキスト化された価格表も抽出
-- 商品 × サイズ × 地域価格を別系列として出力
-- 1996年以前の直近観測値がある系列は 1996-01-01 の基準行を合成
-- 取得できないページ・抽出0件ページは failed に記録
-- data/neage_foodservice_events.json と CSV を生成
+前回版が0件になった主因:
+- neage.jp の価格表は <table> ではなく、本文テキスト上の
+  「商品名」「年月日 価格（税込）」「YYYY年... 価格」
+  という行構造で並んでいるページが多い。
+- そのため、テーブル前提の抽出では raw records = 0 になる。
 
-出力JSONはダッシュボード互換の「配列」です。
+この版では BeautifulSoup.get_text("\n") の行を解析する。
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
+import hashlib
 import json
 import os
 import re
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timezone
-from typing import Any
+from dataclasses import dataclass, asdict
+from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
-START_URL = "https://neage.jp/gaisyoku/index.html"
-BASE_HOST = "neage.jp"
-START_YEAR_DEFAULT = 1996
+
+BASE_URL = "https://neage.jp/gaisyoku/index.html"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; neage-foodservice-dashboard/0.2; respectful research bot)",
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; neage-foodservice-dashboard/0.3; "
+        "respectful research scraper)"
+    ),
     "Accept-Language": "ja,en;q=0.8",
 }
 
-GENERIC_LINES = {
-    "年月日", "価格", "価格（税込）", "年月日 価格（税込）", "税込", "税抜", "S M L",
-    "外食", "飲食店", "ファーストフード", "テイクアウト", "居酒屋", "カテゴリ一覧",
-    "ホーム", "トップページへ", "外食トップへ", "あわせて読みたい関連記事",
+STOP_WORDS = (
+    "参考サイト",
+    "参考リンク",
+    "マクドナルド値上げ・値下げの解説",
+    "値上げ・値下げの解説",
+    "値上げの解説",
+    "あわせて読みたい",
+    "関連記事",
+    "ホーム",
+    "食品の値上げ情報",
+    "外食の値上げ情報",
+    "日用品の値上げ情報",
+    "サービスの値上げ情報",
+    "公共料金などの値上げ",
+    "その他の値上げ情報",
+)
+
+IGNORE_LINES = {
+    "",
+    "年月日",
+    "価格",
+    "価格（税込）",
+    "価格（税込)",
+    "年月日 価格（税込）",
+    "年月日 価格（税込)",
+    "S M L",
+    "S　M　L",
 }
 
-VARIANT_NAMES = [
-    "通常店", "準都心店", "都心店", "標準店", "地方都市店", "都市型店",
-    "店内", "持ち帰り", "テイクアウト", "税込", "標準",
-    "S", "M", "L", "SS", "LL", "小", "並", "大", "特大",
-]
-
 DATE_RE = re.compile(
-    r"(?P<lead>～)?(?P<year>(?:19|20)\d{2})\s*年\s*(?P<month>\d{1,2})?\s*(?:月)?\s*(?P<tail>時点|頃|ごろ|～)?"
+    r"^(?P<prefix>～)?(?P<year>(?:19|20)\d{2})年"
+    r"(?:(?P<month>\d{1,2})月)?"
+    r"(?:(?P<day>\d{1,2})日)?"
+    r"(?:時点|現在|頃|から|より|[～〜~－-])?"
+    r"\s*(?P<rest>.*)$"
 )
-PRICE_RE = re.compile(r"(?P<a>\d{1,4}(?:,\d{3})?)(?:\s*[～〜~－\-]\s*(?P<b>\d{1,4}(?:,\d{3})?))?\s*円\??")
+
+# 価格: 190円 / 260～290円 / 520円？ など
+PRICE_RE = re.compile(
+    r"(?P<a>\d{1,4}(?:,\d{3})?)"
+    r"(?:\s*[～〜~－-]\s*(?P<b>\d{1,4}(?:,\d{3})?))?"
+    r"\s*円"
+    r"(?:[？?])?"
+)
+
+# 地域・タイプ: 通常店：450円 / 準：340円 / 都：370円 など
 VARIANT_PRICE_RE = re.compile(
-    r"(?P<variant>通常店|準都心店|都心店|標準店|地方都市店|都市型店|店内|持ち帰り|テイクアウト|S|M|L|SS|LL|小|並|大|特大)\s*[：:]\s*"
-    r"(?P<price>\d{1,4}(?:,\d{3})?(?:\s*[～〜~－\-]\s*\d{1,4}(?:,\d{3})?)?\s*円\??)"
+    r"(?P<label>通常店|準都心店|都心店|通|準|都|S|M|L|小|中|大)"
+    r"\s*[：:]\s*"
+    r"(?P<a>\d{1,4}(?:,\d{3})?)"
+    r"(?:\s*[～〜~－-]\s*(?P<b>\d{1,4}(?:,\d{3})?))?"
+    r"\s*円"
+    r"(?:[？?])?"
+)
+
+PRICE_TOKEN_RE = re.compile(
+    r"(?:\d{1,4}(?:,\d{3})?(?:\s*[～〜~－-]\s*\d{1,4}(?:,\d{3})?)?\s*円[？?]?|[―－—-])"
 )
 
 
-def clean_text(text: str | None) -> str:
-    if not text:
-        return ""
+def clean(text: str) -> str:
     text = text.replace("\u3000", " ").replace("\xa0", " ")
-    return re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
 
 
 def fetch(url: str, timeout: int = 30) -> str:
     r = requests.get(url, headers=HEADERS, timeout=timeout)
     r.raise_for_status()
-    if not r.encoding or r.encoding.lower() in {"iso-8859-1", "ascii"}:
+    if not r.encoding or r.encoding.lower() == "iso-8859-1":
         r.encoding = r.apparent_encoding or "utf-8"
     return r.text
 
 
-def normalise_url(base: str, href: str) -> str | None:
-    if not href or href.startswith("#"):
-        return None
-    url = urljoin(base, href).split("#", 1)[0]
-    p = urlparse(url)
-    if p.netloc and p.netloc != BASE_HOST:
-        return None
-    if not p.path.startswith("/gaisyoku/"):
-        return None
-    if not (p.path.endswith(".html") or p.path.endswith("/")):
-        return None
-    return url
+def stable_id(*parts: str) -> str:
+    return hashlib.sha1("||".join(parts).encode("utf-8")).hexdigest()[:14]
 
 
-def discover_pages(start_url: str, max_pages: int, delay: float) -> list[str]:
-    """外食カテゴリ配下の .html ページを再帰的に集める。"""
-    seen: set[str] = set()
-    discovered: set[str] = set()
-    q: deque[str] = deque([start_url])
+def normalize_variant(label: str) -> str:
+    m = {
+        "通": "通常店",
+        "準": "準都心店",
+        "都": "都心店",
+    }
+    return m.get(label, label)
 
-    while q and len(seen) < max_pages:
-        url = q.popleft()
+
+def price_value(a: str, b: Optional[str] = None) -> tuple[float, Optional[float], Optional[float]]:
+    a2 = float(a.replace(",", ""))
+    if b:
+        b2 = float(b.replace(",", ""))
+        return (a2 + b2) / 2.0, a2, b2
+    return a2, None, None
+
+
+def date_from_match(m: re.Match) -> str:
+    year = int(m.group("year"))
+    month = int(m.group("month") or 1)
+    day = int(m.group("day") or 1)
+    month = max(1, min(month, 12))
+    day = max(1, min(day, 28))
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def discover_pages(index_url: str, max_pages: int = 200) -> list[str]:
+    html = fetch(index_url)
+    soup = BeautifulSoup(html, "html.parser")
+    found = set()
+    queue = deque([index_url])
+    seen = set()
+
+    # 入口ページで見えるリンクに加え、カテゴリページも軽くたどる。
+    while queue and len(seen) < max_pages:
+        url = queue.popleft()
         if url in seen:
             continue
         seen.add(url)
         try:
             html = fetch(url)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[WARN] discover failed: {url}: {exc}")
+        except Exception:
             continue
-
         soup = BeautifulSoup(html, "html.parser")
         for a in soup.find_all("a", href=True):
-            u = normalise_url(url, a.get("href", ""))
-            if not u:
+            href = urljoin(url, a["href"].split("#")[0])
+            p = urlparse(href)
+            if p.netloc != "neage.jp":
                 continue
-            discovered.add(u)
-            if u not in seen and len(seen) + len(q) < max_pages:
-                q.append(u)
-        time.sleep(delay)
+            if not p.path.startswith("/gaisyoku/"):
+                continue
+            if not p.path.endswith(".html"):
+                continue
+            if href == index_url:
+                continue
+            found.add(href)
+            # index 的なページだけたどる
+            if href.endswith("/index.html") and href not in seen:
+                queue.append(href)
+        time.sleep(0.1)
 
-    # index系は本文にも価格表がないことが多いため後ろに回す/除外する
-    pages = sorted(u for u in discovered if not u.endswith("/index.html") and u != start_url)
-    return pages
+    # index.html は抽出対象から外す
+    return sorted(u for u in found if not u.endswith("/index.html"))
 
 
-def page_meta(soup: BeautifulSoup) -> dict[str, str]:
-    title = clean_text(soup.find("h1").get_text(" ")) if soup.find("h1") else ""
-    all_text = clean_text(soup.get_text(" "))
-    shop = ""
+def extract_meta(lines: list[str], soup: BeautifulSoup, url: str) -> dict:
+    h1 = soup.find("h1")
+    title = clean(h1.get_text(" ")) if h1 else ""
     company = ""
-    m = re.search(r"店名\s+([^\s]+)", all_text)
-    if m:
-        shop = clean_text(m.group(1))
-    m = re.search(r"運営会社\s+([^\s]+)", all_text)
-    if m:
-        company = clean_text(m.group(1))
-    if not shop:
-        shop = re.sub(r"の値上げ.*$", "", title).strip() or title or "不明チェーン"
-    return {"title": title, "chain": shop, "company": company}
+    chain = ""
+    for line in lines[:60]:
+        if line.startswith("運営会社"):
+            company = clean(line.replace("運営会社", "", 1))
+        elif line.startswith("店名"):
+            chain = clean(line.replace("店名", "", 1))
+    if not chain:
+        chain = re.sub(r"の値上げ.*$", "", title).strip() or title or url.rsplit("/", 1)[-1].replace(".html", "")
+    return {"page_title": title, "company": company, "chain": chain}
 
 
-def parse_date_from_line(line: str) -> tuple[str, str, str] | None:
-    m = DATE_RE.search(line)
-    if not m:
-        return None
-    year = int(m.group("year"))
-    month = int(m.group("month") or 1)
-    month = min(max(month, 1), 12)
-    date = f"{year:04d}-{month:02d}-01"
-    rest = (line[: m.start()] + " " + line[m.end() :]).strip()
-    return date, clean_text(rest), clean_text(m.group(0))
-
-
-def price_value(price_text: str) -> tuple[float | None, float | None, float | None]:
-    m = PRICE_RE.search(price_text)
-    if not m:
-        return None, None, None
-    a = float(m.group("a").replace(",", ""))
-    b = float(m.group("b").replace(",", "")) if m.group("b") else None
-    if b is None:
-        return a, None, None
-    return (a + b) / 2.0, a, b
-
-
-def extract_variant_prices(text: str, default_variant: str = "標準") -> list[dict[str, Any]]:
-    """1行中の価格を variant 別に抽出。"""
-    out: list[dict[str, Any]] = []
-
-    # 通常店：480円 / 準都心店：500円 のような表記
-    for m in VARIANT_PRICE_RE.finditer(text):
-        val, lo, hi = price_value(m.group("price"))
-        if val is not None:
-            out.append({
-                "variant": clean_text(m.group("variant")),
-                "price": val,
-                "price_min": lo,
-                "price_max": hi,
-                "raw_price": clean_text(m.group("price")),
-            })
-    if out:
-        return out
-
-    # 通常の「190円」「240～270円」
-    m = PRICE_RE.search(text)
-    if m:
-        val, lo, hi = price_value(m.group(0))
-        if val is not None:
-            out.append({
-                "variant": default_variant,
-                "price": val,
-                "price_min": lo,
-                "price_max": hi,
-                "raw_price": clean_text(m.group(0)),
-            })
-    return out
-
-
-def line_has_price(line: str) -> bool:
-    return bool(PRICE_RE.search(line) or VARIANT_PRICE_RE.search(line))
-
-
-def looks_like_item_heading(line: str, next_lines: list[str]) -> bool:
-    line = clean_text(line)
-    if not line or line in GENERIC_LINES:
+def is_stop(line: str) -> bool:
+    if not line:
         return False
-    if len(line) > 42:
-        return False
-    if line_has_price(line) or DATE_RE.search(line):
-        return False
-    if any(x in line for x in ["運営会社", "店名", "創業", "Copyright", "関連記事", "値上げ情報", "カテゴリ", "トップ"]):
-        return False
-    joined_next = " ".join(next_lines[:3])
-    if "年月日" in joined_next and "価格" in joined_next:
+    if line.startswith("#") or line.startswith("##") or line.startswith("###"):
         return True
-    # S/M/L 表の直前にも商品名が来る
-    if any(DATE_RE.search(n) and line_has_price(n) for n in next_lines[:4]):
-        return True
-    return False
+    return any(w in line for w in STOP_WORDS)
 
 
-def parse_multicol_date_line(line: str, size_header: list[str]) -> list[dict[str, Any]]:
-    """例: '1980年～ 140円 ― 250円' を S/M/L に対応付ける。"""
-    parsed = parse_date_from_line(line)
-    if not parsed:
-        return []
-    date, rest, _date_raw = parsed
-    # 価格トークンとダッシュを順序維持で抽出
-    tokens = re.findall(r"\d{1,4}(?:,\d{3})?(?:\s*[～〜~－\-]\s*\d{1,4}(?:,\d{3})?)?\s*円\??|[―—-]", rest)
-    if len(tokens) < 2 or len(size_header) < 2:
-        return []
-    out = []
-    for variant, tok in zip(size_header, tokens):
-        if tok in {"―", "—", "-"}:
-            continue
-        val, lo, hi = price_value(tok)
-        if val is None:
-            continue
-        out.append({
-            "date": date,
-            "variant": variant,
-            "price": val,
-            "price_min": lo,
-            "price_max": hi,
-            "raw_price": clean_text(tok),
-        })
-    return out
+def looks_like_product_title(line: str) -> bool:
+    if not line:
+        return False
+    if is_stop(line):
+        return False
+    if line in IGNORE_LINES:
+        return False
+    if DATE_RE.match(line):
+        return False
+    if PRICE_RE.search(line):
+        return False
+    if line.startswith(("運営会社", "店名", "創業")):
+        return False
+    if len(line) > 70:
+        return False
+    # 日本語・英数字を含む短い見出し
+    return bool(re.search(r"[ぁ-んァ-ン一-龥A-Za-z0-9]", line))
 
 
-def extract_text_records(url: str, soup: BeautifulSoup, start_year: int) -> list[dict[str, Any]]:
-    meta = page_meta(soup)
-    # テキスト行に分解。HTMLテーブルでなくても抽出できるようにする。
-    raw_lines = [clean_text(x) for x in soup.get_text("\n").split("\n")]
+def is_header_line(line: str) -> bool:
+    # get_textの分割方法によって「年月日」「価格（税込）」が別行になることがある
+    return ("年月日" in line and "価格" in line) or line == "年月日"
+
+
+@dataclass
+class Record:
+    chain: str
+    company: str
+    product: str
+    variant: str
+    date: str
+    price: float
+    price_min: Optional[float]
+    price_max: Optional[float]
+    price_raw: str
+    index: Optional[float]
+    source_url: str
+    page_title: str
+    is_baseline_1996: bool = False
+    series_id: str = ""
+
+
+def add_record(records: list[Record], meta: dict, product: str, variant: str, date: str, price: float,
+               price_min: Optional[float], price_max: Optional[float], raw: str, url: str):
+    variant = normalize_variant(variant or "標準")
+    product = product or "不明商品"
+    series_id = stable_id(meta["chain"], product, variant, url)
+    records.append(
+        Record(
+            chain=meta["chain"],
+            company=meta["company"],
+            product=product,
+            variant=variant,
+            date=date,
+            price=round(float(price), 2),
+            price_min=price_min,
+            price_max=price_max,
+            price_raw=raw,
+            index=None,
+            source_url=url,
+            page_title=meta["page_title"],
+            series_id=series_id,
+        )
+    )
+
+
+def parse_prices_from_rest(records: list[Record], meta: dict, product: str, date: str, rest: str,
+                           url: str, size_headers: Optional[list[str]] = None):
+    rest = clean(rest)
+    if not rest:
+        return
+
+    # 1) 通常店：450円 / 準：340円 などのラベル付き価格
+    labelled = list(VARIANT_PRICE_RE.finditer(rest))
+    if labelled:
+        for m in labelled:
+            val, mn, mx = price_value(m.group("a"), m.group("b"))
+            add_record(records, meta, product, m.group("label"), date, val, mn, mx, rest, url)
+        # ラベル付き価格がある場合でも、行頭に「190円 通：330円」のような
+        # ラベルなし価格が混じることがある。これは標準/Sとして拾う。
+        prefix = rest[: labelled[0].start()].strip()
+        plain = list(PRICE_RE.finditer(prefix))
+        if plain:
+            for i, pm in enumerate(plain):
+                val, mn, mx = price_value(pm.group("a"), pm.group("b"))
+                variant = size_headers[i] if size_headers and i < len(size_headers) else ("標準" if i == 0 else f"価格{i+1}")
+                add_record(records, meta, product, variant, date, val, mn, mx, rest, url)
+        return
+
+    # 2) S M Lのようなサイズ列
+    tokens = PRICE_TOKEN_RE.findall(rest)
+    price_matches = list(PRICE_RE.finditer(rest))
+    if size_headers and tokens:
+        price_i = 0
+        for i, token in enumerate(tokens):
+            token = clean(token)
+            if token in ("―", "－", "—", "-"):
+                continue
+            pm = PRICE_RE.search(token)
+            if not pm:
+                continue
+            val, mn, mx = price_value(pm.group("a"), pm.group("b"))
+            variant = size_headers[i] if i < len(size_headers) else f"価格{price_i+1}"
+            add_record(records, meta, product, variant, date, val, mn, mx, rest, url)
+            price_i += 1
+        return
+
+    # 3) 通常の1列価格、または複数価格
+    if price_matches:
+        for i, pm in enumerate(price_matches):
+            val, mn, mx = price_value(pm.group("a"), pm.group("b"))
+            variant = "標準" if len(price_matches) == 1 else f"価格{i+1}"
+            add_record(records, meta, product, variant, date, val, mn, mx, rest, url)
+
+
+def extract_page_records(url: str) -> tuple[list[Record], str]:
+    html = fetch(url)
+    soup = BeautifulSoup(html, "html.parser")
+    raw_lines = [clean(x) for x in soup.get_text("\n").splitlines()]
     lines = [x for x in raw_lines if x]
 
-    records: list[dict[str, Any]] = []
-    current_item = ""
-    in_price_block = False
-    size_header: list[str] = []
-    last_date: str | None = None
-    last_date_raw: str | None = None
+    meta = extract_meta(lines, soup, url)
+    records: list[Record] = []
 
+    product = ""
+    active = False
+    current_date: Optional[str] = None
+    size_headers: Optional[list[str]] = None
+    pre_header_product: Optional[str] = None
+    price_line_count_after_header = 0
+
+    # 価格表の構造:
+    # 商品名
+    # 年月日 価格（税込）
+    # 1971年7月～ 80円
+    # ...
     for i, line in enumerate(lines):
-        next_lines = lines[i + 1 : i + 5]
+        if is_stop(line) and active:
+            break
 
-        if looks_like_item_heading(line, next_lines):
-            current_item = line
-            in_price_block = False
-            size_header = []
-            last_date = None
-            last_date_raw = None
+        # 商品名候補を保存。次に「年月日」が来たらこれを商品名として採用。
+        if looks_like_product_title(line):
+            # 「S M L」はサイズヘッダなので商品名候補から除外
+            if re.fullmatch(r"[SML小中大](\s+[SML小中大])+", line):
+                pass
+            else:
+                pre_header_product = line
+
+        if is_header_line(line):
+            if pre_header_product:
+                product = pre_header_product
+            active = True
+            current_date = None
+            size_headers = None
+            price_line_count_after_header = 0
             continue
 
-        if "年月日" in line and "価格" in line:
-            in_price_block = True
-            # 同じ行に S M L が含まれるケースも拾う
-            cols = [x for x in re.split(r"\s+", line) if x in {"S", "M", "L", "SS", "LL"}]
-            if cols:
-                size_header = cols
+        if not active:
             continue
 
-        if in_price_block and re.fullmatch(r"(?:S|M|L|SS|LL)(?:\s+(?:S|M|L|SS|LL))+", line):
-            size_header = line.split()
+        # サイズヘッダー: S M L / 並 大 特盛 など
+        if re.fullmatch(r"(S|M|L|小|中|大)(\s+(S|M|L|小|中|大))+", line):
+            size_headers = line.split()
             continue
 
-        if not in_price_block or not current_item:
-            continue
-
-        # 新しい商品ブロックに移った可能性
-        if looks_like_item_heading(line, next_lines):
-            current_item = line
-            in_price_block = False
-            size_header = []
-            last_date = None
-            last_date_raw = None
-            continue
-
-        parsed_date = parse_date_from_line(line)
-        if parsed_date:
-            date, rest, date_raw = parsed_date
-            last_date = date
-            last_date_raw = date_raw
-
-            # S/M/L など複数列表
-            multi = parse_multicol_date_line(line, size_header)
-            if multi:
-                for p in multi:
-                    records.append(make_record(url, meta, current_item, p["variant"], p["date"], p["price"], p["raw_price"], line, p.get("price_min"), p.get("price_max"), False))
+        # 次の商品見出しに移った可能性。
+        # 価格表の途中にある地域価格行は商品名扱いしない。
+        if looks_like_product_title(line):
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if is_header_line(nxt):
+                # 次ループで商品名として採用される
+                active = False
+                current_date = None
+                size_headers = None
                 continue
 
-            # 同一行の通常価格・地域別価格
-            for p in extract_variant_prices(rest or line):
-                records.append(make_record(url, meta, current_item, p["variant"], date, p["price"], p["raw_price"], line, p.get("price_min"), p.get("price_max"), False))
+        dm = DATE_RE.match(line)
+        if dm:
+            current_date = date_from_match(dm)
+            rest = clean(dm.group("rest"))
+            parse_prices_from_rest(records, meta, product, current_date, rest, url, size_headers)
+            price_line_count_after_header += 1
             continue
 
-        # 日付の次行に「準都心店：470円」のように続くケース
-        if last_date and line_has_price(line):
-            for p in extract_variant_prices(line):
-                records.append(make_record(url, meta, current_item, p["variant"], last_date, p["price"], p["raw_price"], line, p.get("price_min"), p.get("price_max"), False))
+        # 日付の次行に「準都心店：470円」「都心店：500円」等が来るケース
+        if current_date and PRICE_RE.search(line):
+            parse_prices_from_rest(records, meta, product, current_date, line, url, size_headers)
+            price_line_count_after_header += 1
             continue
 
-        # 長い説明文が来たら価格ブロック終了とみなす
-        if len(line) > 60 and not line_has_price(line):
-            in_price_block = False
-            size_header = []
-            last_date = None
-            last_date_raw = None
+        # 価格表に入ったあと、しばらく価格が出なければ表終了とみなす
+        if active and price_line_count_after_header > 0 and not PRICE_RE.search(line):
+            # ただし空白・補足っぽい行は無視
+            pass
 
-    return records
+    return records, meta.get("chain", "")
 
 
-def make_record(url: str, meta: dict[str, str], item: str, variant: str, date: str, price: float, raw_price: str, raw_line: str, price_min: float | None, price_max: float | None, synthetic: bool) -> dict[str, Any]:
-    return {
-        "chain": meta["chain"],
-        "company": meta.get("company", ""),
-        "product": item,
-        "item": item,
-        "variant": variant or "標準",
-        "date": date,
-        "price": round(float(price), 2),
-        "price_min": price_min,
-        "price_max": price_max,
-        "index": None,
-        "source_url": url,
-        "raw_price": raw_price,
-        "raw_line": raw_line,
-        "page_title": meta.get("title", ""),
-        "is_baseline_1996": synthetic,
-    }
-
-
-def series_key(r: dict[str, Any]) -> tuple[str, str, str, str]:
-    return (r["chain"], r["product"], r["variant"], r["source_url"])
-
-
-def normalise(records: list[dict[str, Any]], start_year: int) -> list[dict[str, Any]]:
+def normalise_records(records: list[Record], start_year: int) -> list[Record]:
     cutoff = f"{start_year:04d}-01-01"
-    groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    groups: dict[str, list[Record]] = defaultdict(list)
     for r in records:
-        groups[series_key(r)].append(r)
+        groups[r.series_id].append(r)
 
-    out: list[dict[str, Any]] = []
-    for _key, arr in groups.items():
-        # 同日・同価格重複除去
-        unique = {}
-        for r in arr:
-            sig = (r["date"], r["price"], r["variant"], r["product"])
-            unique[sig] = r
-        arr = sorted(unique.values(), key=lambda x: x["date"])
-        if not arr:
-            continue
-
-        before = [r for r in arr if r["date"] < cutoff]
-        after = [r for r in arr if r["date"] >= cutoff]
+    out: list[Record] = []
+    for sid, arr in groups.items():
+        arr = sorted(arr, key=lambda r: r.date)
+        before = [r for r in arr if r.date < cutoff]
+        after = [r for r in arr if r.date >= cutoff]
 
         if before:
-            base = dict(before[-1])
-            base["date"] = cutoff
-            base["raw_line"] = f"{start_year}年基準として合成 / 直前観測値: {before[-1]['date']} {before[-1]['raw_line']}"
-            base["is_baseline_1996"] = True
-            after = [base] + after
+            base = before[-1]
+            baseline = Record(**asdict(base))
+            baseline.date = cutoff
+            baseline.is_baseline_1996 = True
+            baseline.price_raw = f"1996年基準行（直前観測値: {base.date} / {base.price_raw}）"
+            after = [baseline] + after
 
         if not after:
             continue
 
-        base_price = after[0]["price"]
+        base_price = after[0].price
+        seen = set()
         for r in after:
-            r = dict(r)
-            r["index"] = round((r["price"] / base_price) * 100, 2) if base_price else None
+            sig = (r.series_id, r.date, r.price, r.variant, r.product)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            r.index = round((r.price / base_price) * 100.0, 2) if base_price else None
             out.append(r)
 
-    return sorted(out, key=lambda x: (x["chain"], x["product"], x["variant"], x["date"]))
+    return sorted(out, key=lambda r: (r.chain, r.product, r.variant, r.date))
 
 
-def write_outputs(records: list[dict[str, Any]], json_path: str, csv_path: str, failed_path: str, failed: list[dict[str, Any]]) -> None:
-    os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
-    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+def write_outputs(records: list[Record], failed: list[dict], out_json: str, out_csv: str, failed_json: str):
+    os.makedirs(os.path.dirname(out_json), exist_ok=True)
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    os.makedirs(os.path.dirname(failed_json), exist_ok=True)
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False, indent=2)
+    rows = [asdict(r) for r in records]
 
-    if records:
-        fields = list(records[0].keys())
-        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fields)
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+
+    if rows:
+        with open(out_csv, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             w.writeheader()
-            w.writerows(records)
+            w.writerows(rows)
     else:
-        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        with open(out_csv, "w", encoding="utf-8-sig", newline="") as f:
             f.write("")
 
-    with open(failed_path, "w", encoding="utf-8") as f:
-        json.dump({"generated_at": datetime.now(timezone.utc).isoformat(), "failed": failed}, f, ensure_ascii=False, indent=2)
+    with open(failed_json, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "failed_count": len(failed),
+                "failed": failed,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--start-year", type=int, default=START_YEAR_DEFAULT)
-    ap.add_argument("--out", default="data/neage_foodservice_events.json")
-    ap.add_argument("--csv", default="data/neage_foodservice_events.csv")
-    ap.add_argument("--failed", default="data/neage_foodservice_failed.json")
-    ap.add_argument("--start-url", default=START_URL)
-    ap.add_argument("--delay", type=float, default=0.7)
-    ap.add_argument("--max-pages", type=int, default=180)
-    ap.add_argument("--limit", type=int, default=0)
-    args = ap.parse_args()
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start-year", type=int, default=1996)
+    parser.add_argument("--base-url", default=BASE_URL)
+    parser.add_argument("--out", default="data/neage_foodservice_events.json")
+    parser.add_argument("--csv", default="data/neage_foodservice_events.csv")
+    parser.add_argument("--failed", default="data/neage_foodservice_failed.json")
+    parser.add_argument("--delay", type=float, default=0.75)
+    parser.add_argument("--limit", type=int, default=0)
+    args = parser.parse_args()
 
-    print(f"[INFO] discovering pages from {args.start_url}")
-    pages = discover_pages(args.start_url, args.max_pages, args.delay)
+    print(f"[INFO] discovering pages from {args.base_url}")
+    pages = discover_pages(args.base_url)
     if args.limit:
         pages = pages[: args.limit]
     print(f"[INFO] candidate pages: {len(pages)}")
 
-    all_records: list[dict[str, Any]] = []
-    failed: list[dict[str, Any]] = []
-    for idx, url in enumerate(pages, start=1):
+    all_records: list[Record] = []
+    failed: list[dict] = []
+
+    for i, url in enumerate(pages, 1):
         try:
-            html = fetch(url)
-            soup = BeautifulSoup(html, "html.parser")
-            recs = extract_text_records(url, soup, args.start_year)
+            recs, chain = extract_page_records(url)
+            print(f"[INFO] {i}/{len(pages)} {url} -> {len(recs)} raw records")
             if not recs:
                 failed.append({"url": url, "reason": "no_records_extracted"})
             all_records.extend(recs)
-            print(f"[INFO] {idx}/{len(pages)} {url} -> {len(recs)} raw records")
-        except Exception as exc:  # noqa: BLE001
-            failed.append({"url": url, "reason": str(exc)})
-            print(f"[WARN] {idx}/{len(pages)} {url} -> {exc}")
+        except Exception as e:
+            print(f"[WARN] {i}/{len(pages)} {url} -> {type(e).__name__}: {e}")
+            failed.append({"url": url, "reason": f"{type(e).__name__}: {e}"})
         time.sleep(args.delay)
 
-    records = normalise(all_records, args.start_year)
-    write_outputs(records, args.out, args.csv, args.failed, failed)
+    normalised = normalise_records(all_records, args.start_year)
+    series_count = len({r.series_id for r in normalised})
 
-    series_count = len({series_key(r) for r in records})
-    print(f"[DONE] records={len(records)} series={series_count} failed={len(failed)}")
+    write_outputs(normalised, failed, args.out, args.csv, args.failed)
+
+    print(f"[DONE] records={len(normalised)} series={series_count} failed={len(failed)}")
     print(f"[DONE] wrote {args.out}")
     print(f"[DONE] wrote {args.csv}")
     print(f"[DONE] wrote {args.failed}")
