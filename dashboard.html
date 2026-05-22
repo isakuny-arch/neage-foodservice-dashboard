@@ -1,228 +1,162 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html lang="ja">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>neage Foodservice Dashboard</title>
-  <!-- Chart.js for graphs -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <!-- jQuery and DataTables for tables -->
-  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-  <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css" />
-  <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
   <style>
-    body {
-      font-family: Arial, sans-serif;
-      margin: 0;
-      padding: 20px;
-      line-height: 1.5;
-    }
-    h1, h2 {
-      margin-top: 1em;
-    }
-    #chart-container {
-      width: 100%;
-      max-width: 1000px;
-      margin-bottom: 2rem;
-    }
-    table.dataTable {
-      width: 100% !important;
-    }
+    :root{--bg:#f6f1e7;--panel:#fffaf1;--ink:#211d18;--muted:#70665b;--line:#ddd0bf;--red:#b84d32;--green:#2f6f73;--shadow:0 16px 40px rgba(70,45,20,.11)}
+    *{box-sizing:border-box}
+    body{margin:0;padding:28px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans JP",sans-serif;background:linear-gradient(135deg,#faf6ef,#eee2d2);color:var(--ink)}
+    h1{font-family:"Yu Mincho","Hiragino Mincho ProN",serif;font-size:clamp(34px,5vw,64px);letter-spacing:-.04em;margin:0 0 8px}
+    .lead{color:var(--muted);line-height:1.8;max-width:900px}
+    .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:20px 0}
+    .card,.panel{background:rgba(255,250,241,.9);border:1px solid var(--line);border-radius:20px;box-shadow:var(--shadow);padding:16px}
+    .card span{font-size:12px;color:var(--muted);font-weight:800}.card strong{display:block;font-size:32px;margin-top:8px}
+    .toolbar{display:grid;grid-template-columns:1fr 220px 220px;gap:10px;margin:16px 0}
+    input,select{font:inherit;padding:12px 14px;border:1px solid var(--line);border-radius:999px;background:#fff}
+    .grid{display:grid;grid-template-columns:1.15fr .85fr;gap:12px}
+    .chartBox{height:390px}
+    canvas{width:100%!important;height:100%!important}
+    table{width:100%;border-collapse:collapse;font-size:13px;background:white}
+    th,td{padding:9px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+    th{position:sticky;top:0;background:#fffaf1;color:var(--muted);z-index:2}
+    .tablewrap{max-height:560px;overflow:auto;border:1px solid var(--line);border-radius:14px}
+    .pill{display:inline-block;border-radius:999px;padding:4px 8px;background:rgba(47,111,115,.12);color:var(--green);font-weight:800;font-size:11px}
+    .bad{color:var(--red);font-weight:800}
+    .note{font-size:12px;color:var(--muted);line-height:1.6}
+    a{color:#0b65c2}
+    @media(max-width:900px){.kpis,.grid,.toolbar{grid-template-columns:1fr}.chartBox{height:300px}table{min-width:960px}}
   </style>
 </head>
 <body>
   <h1>neage Foodservice Dashboard</h1>
-  <p>
-    Select chain:
-    <select id="chain-select"></select>
-  </p>
-  <div id="chart-container">
-    <canvas id="chart"></canvas>
+  <p class="lead">値上げ備忘録の外食カテゴリを取得し、1996年を起点に価格指数化します。商品×サイズ×地域価格を別系列として扱い、出典URLも保持します。</p>
+
+  <div class="toolbar">
+    <input id="q" placeholder="チェーン・商品・バリアントで検索">
+    <select id="chain"><option value="">全チェーン</option></select>
+    <select id="variant"><option value="">全バリアント</option></select>
   </div>
-  <h2>Price Index Ranking (latest value)</h2>
-  <table id="ranking-table" class="display"></table>
-  <h2>All Records</h2>
-  <table id="data-table" class="display"></table>
 
-  <script>
-    /**
-     * Fetch the data file.  This assumes that the JSON file is located at
-     * `data/neage_foodservice_events.json` relative to this HTML page.  If
-     * hosting via GitHub Pages the data folder should be published as part
-     * of the site.
-     */
-    async function loadData() {
-      const response = await fetch('data/neage_foodservice_events.json');
-      if (!response.ok) {
-        console.error('Failed to load JSON data', response.status);
-        return [];
-      }
-      return await response.json();
-    }
+  <div class="kpis">
+    <div class="card"><span>レコード数</span><strong id="kRecords">-</strong></div>
+    <div class="card"><span>系列数</span><strong id="kSeries">-</strong></div>
+    <div class="card"><span>チェーン数</span><strong id="kChains">-</strong></div>
+    <div class="card"><span>最大指数</span><strong id="kMax">-</strong></div>
+  </div>
 
-    /**
-     * Compute price indices relative to the first observed price on or before
-     * the baseline year.  Each unique (chain, product, variant) series is
-     * normalised independently.
-     */
-    function computeIndices(records, startYear) {
-      const seriesMap = {};
-      records.forEach((rec) => {
-        const key = `${rec.chain}|${rec.product}|${rec.variant}`;
-        (seriesMap[key] = seriesMap[key] || []).push(rec);
-      });
-      const indices = [];
-      Object.values(seriesMap).forEach((series) => {
-        series.sort((a, b) => new Date(a.date) - new Date(b.date));
-        let baseline = null;
-        for (const rec of series) {
-          const year = new Date(rec.date).getFullYear();
-          if (year <= startYear) {
-            baseline = rec.price;
-          }
-        }
-        if (baseline === null) {
-          baseline = series[0].price;
-        }
-        series.forEach((rec) => {
-          indices.push({
-            chain: rec.chain,
-            product: rec.product,
-            variant: rec.variant,
-            date: rec.date,
-            price: rec.price,
-            index: (rec.price / baseline) * 100,
-            source_url: rec.source_url,
-          });
-        });
-      });
-      return indices;
-    }
+  <div class="grid">
+    <section class="panel">
+      <h2>価格指数タイムライン</h2>
+      <p class="note">表示対象のうち、最新指数が高い上位20系列を描画します。</p>
+      <div class="chartBox"><canvas id="lineChart"></canvas></div>
+    </section>
+    <section class="panel">
+      <h2>上昇率ランキング</h2>
+      <div id="ranking" class="tablewrap"></div>
+    </section>
+  </div>
 
-    /** Build the ranking table showing the latest index for each chain. */
-    function buildRanking(indices) {
-      const latestMap = {};
-      indices.forEach((rec) => {
-        const key = rec.chain;
-        const recDate = new Date(rec.date);
-        if (!latestMap[key] || recDate > new Date(latestMap[key].date)) {
-          latestMap[key] = rec;
-        }
-      });
-      return Object.entries(latestMap)
-        .map(([chain, rec]) => [chain, rec.index])
-        .sort((a, b) => b[1] - a[1]);
-    }
+  <section class="panel" style="margin-top:12px">
+    <h2>All Records</h2>
+    <p class="note" id="status">読み込み中...</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>日付</th><th>チェーン</th><th>商品</th><th>区分</th><th>価格</th><th>指数</th><th>出典</th></tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </section>
 
-    /** Populate the chain selector. */
-    function populateChainSelect(chains) {
-      const select = document.getElementById('chain-select');
-      chains.forEach((chain) => {
-        const opt = document.createElement('option');
-        opt.value = chain;
-        opt.textContent = chain;
-        select.appendChild(opt);
-      });
-    }
+<script>
+let raw=[], filtered=[], chart;
+const $=id=>document.getElementById(id);
+const fmt=n=>Number(n||0).toLocaleString();
 
-    /** Render a line chart for the selected chain. */
-    function drawChart(indices, chain) {
-      const ctx = document.getElementById('chart').getContext('2d');
-      const filtered = indices.filter((i) => i.chain === chain);
-      const seriesMap = {};
-      filtered.forEach((rec) => {
-        const key = `${rec.product} ${rec.variant}`;
-        (seriesMap[key] = seriesMap[key] || []).push(rec);
-      });
-      const labels = Array.from(
-        new Set(filtered.map((rec) => rec.date))
-      ).sort();
-      const datasets = Object.entries(seriesMap).map(([name, list]) => {
-        const data = labels.map((d) => {
-          const r = list.find((x) => x.date === d);
-          return r ? r.index : null;
-        });
-        return { label: name, data, fill: false };
-      });
-      if (window.chartInstance) {
-        window.chartInstance.destroy();
-      }
-      window.chartInstance = new Chart(ctx, {
-        type: 'line',
-        data: { labels, datasets },
-        options: {
-          responsive: true,
-          interaction: { mode: 'index', intersect: false },
-          plugins: {
-            tooltip: {
-              callbacks: {
-                label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)}`,
-              },
-            },
-            legend: {
-              position: 'bottom',
-            },
-          },
-          scales: {
-            y: { title: { display: true, text: 'Price Index (1996 = 100)' } },
-            x: { title: { display: true, text: 'Date' } },
-          },
-        },
-      });
-    }
-
-    /** Initialise the dashboard. */
-    async function init() {
-      const raw = await loadData();
-      if (!raw.length) {
-        alert('No data found. Make sure you have run the scraper and uploaded the JSON.');
-        return;
-      }
-      const indices = computeIndices(raw, 1996);
-      const chains = Array.from(new Set(indices.map((i) => i.chain))).sort();
-      populateChainSelect(chains);
-      document.getElementById('chain-select').addEventListener('change', function () {
-        drawChart(indices, this.value);
-      });
-      drawChart(indices, chains[0]);
-
-      // Ranking table
-      const ranking = buildRanking(indices);
-      $('#ranking-table').DataTable({
-        data: ranking,
-        columns: [
-          { title: 'Chain' },
-          { title: 'Latest Index' },
-        ],
-        destroy: true,
-      });
-
-      // Full data table
-      const tableData = indices.map((rec) => [
-        rec.chain,
-        rec.product,
-        rec.variant,
-        rec.date,
-        rec.price.toFixed(2),
-        rec.index.toFixed(1),
-        rec.source_url,
-      ]);
-      $('#data-table').DataTable({
-        data: tableData,
-        columns: [
-          { title: 'Chain' },
-          { title: 'Product' },
-          { title: 'Variant' },
-          { title: 'Date' },
-          { title: 'Price' },
-          { title: 'Index' },
-          { title: 'Source URL' },
-        ],
-        pageLength: 25,
-        destroy: true,
-      });
-    }
-    init();
-  </script>
+async function load(){
+  const paths=['data/neage_foodservice_events.json','neage_foodservice_events.json'];
+  let lastErr='';
+  for(const p of paths){
+    try{
+      const r=await fetch(p+'?ts='+Date.now());
+      if(!r.ok){lastErr=p+' status '+r.status; continue;}
+      const j=await r.json();
+      raw = Array.isArray(j) ? j : (j.events || []);
+      break;
+    }catch(e){lastErr=String(e)}
+  }
+  if(!raw.length){
+    $('status').innerHTML='データが0件です。Actionsログで <code>[DONE] records=</code> が0より大きいか確認してください。最後のエラー: '+lastErr;
+    return;
+  }
+  initFilters();
+  render();
+}
+function initFilters(){
+  const chains=[...new Set(raw.map(r=>r.chain).filter(Boolean))].sort();
+  const variants=[...new Set(raw.map(r=>r.variant).filter(Boolean))].sort();
+  $('chain').innerHTML='<option value="">全チェーン</option>'+chains.map(x=>`<option>${esc(x)}</option>`).join('');
+  $('variant').innerHTML='<option value="">全バリアント</option>'+variants.map(x=>`<option>${esc(x)}</option>`).join('');
+  $('q').oninput=render; $('chain').onchange=render; $('variant').onchange=render;
+}
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+function applyFilters(){
+  const q=$('q').value.toLowerCase().trim(), c=$('chain').value, v=$('variant').value;
+  filtered=raw.filter(r=>(!c||r.chain===c)&&(!v||r.variant===v)&&(!q||[r.chain,r.product,r.variant,r.page_title].join(' ').toLowerCase().includes(q)));
+}
+function latestBySeries(rows){
+  const m=new Map();
+  rows.forEach(r=>{const id=r.series_id || [r.chain,r.product,r.variant,r.source_url].join('|'); if(!m.has(id)||r.date>m.get(id).date)m.set(id,r)});
+  return [...m.values()];
+}
+function render(){
+  applyFilters();
+  const latest=latestBySeries(filtered);
+  $('status').textContent=`表示中: ${filtered.length.toLocaleString()}件`;
+  $('kRecords').textContent=fmt(filtered.length);
+  $('kSeries').textContent=fmt(latest.length);
+  $('kChains').textContent=fmt(new Set(filtered.map(r=>r.chain)).size);
+  const max=latest.reduce((a,b)=>(Number(a?.index||0)>Number(b.index||0)?a:b), null);
+  $('kMax').textContent=max?Number(max.index).toFixed(0):'-';
+  renderTable(filtered);
+  renderRanking(latest);
+  renderChart(filtered, latest);
+}
+function renderTable(rows){
+  $('tbody').innerHTML=rows.slice().sort((a,b)=>b.date.localeCompare(a.date)).slice(0,2000).map(r=>`
+    <tr>
+      <td>${esc(r.date)}${r.is_baseline_1996?'<br><span class="pill">1996基準</span>':''}</td>
+      <td>${esc(r.chain)}</td>
+      <td>${esc(r.product)}</td>
+      <td><span class="pill">${esc(r.variant)}</span></td>
+      <td>${fmt(r.price)}円</td>
+      <td class="bad">${Number(r.index||0).toFixed(0)}</td>
+      <td><a target="_blank" href="${esc(r.source_url)}">source</a></td>
+    </tr>`).join('');
+}
+function renderRanking(latest){
+  const rows=latest.slice().sort((a,b)=>Number(b.index||0)-Number(a.index||0)).slice(0,50);
+  $('ranking').innerHTML=`<table><thead><tr><th>順位</th><th>系列</th><th>指数</th></tr></thead><tbody>`+
+    rows.map((r,i)=>`<tr><td>${i+1}</td><td>${esc(r.chain)} / ${esc(r.product)} / ${esc(r.variant)}<br><span class="note">${esc(r.date)} ${fmt(r.price)}円</span></td><td class="bad">${Number(r.index||0).toFixed(0)}</td></tr>`).join('')+
+    `</tbody></table>`;
+}
+function renderChart(rows, latest){
+  const topIds=new Set(latest.slice().sort((a,b)=>Number(b.index||0)-Number(a.index||0)).slice(0,20).map(r=>r.series_id));
+  const groups=new Map();
+  rows.filter(r=>topIds.has(r.series_id)).forEach(r=>{if(!groups.has(r.series_id))groups.set(r.series_id,[]);groups.get(r.series_id).push(r)});
+  const labels=[...new Set([...groups.values()].flat().map(r=>r.date))].sort();
+  const colors=['#b84d32','#2f6f73','#b9892e','#405f8c','#7b5aa6','#a34362','#4c7661','#9a6a2e'];
+  const datasets=[...groups.values()].map((arr,i)=>{
+    arr.sort((a,b)=>a.date.localeCompare(b.date));
+    const name=arr[0].chain+' '+arr[0].product+' '+arr[0].variant;
+    return {label:name,data:labels.map(d=>{const r=arr.find(x=>x.date===d);return r?Number(r.index):null}),spanGaps:true,borderWidth:2,pointRadius:2,borderColor:colors[i%colors.length]};
+  });
+  if(chart) chart.destroy();
+  chart=new Chart($('lineChart'),{type:'line',data:{labels,datasets},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'nearest',intersect:false},plugins:{legend:{position:'bottom'}},scales:{y:{title:{display:true,text:'指数'}},x:{ticks:{maxTicksLimit:8}}}}});
+}
+load();
+</script>
 </body>
 </html>
